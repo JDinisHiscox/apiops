@@ -16,7 +16,7 @@ namespace publisher;
 
 internal static class Api
 {
-    public static async ValueTask ProcessDeletedArtifacts(IReadOnlyCollection<FileInfo> files, JsonObject configurationJson, ServiceDirectory serviceDirectory, ServiceUri serviceUri, PutRestResource putRestResource, DeleteRestResource deleteRestResource, ILogger logger, CancellationToken cancellationToken)
+    public static async ValueTask ProcessDeletedArtifacts(IReadOnlyCollection<FileInfo> files, JsonObject configurationJson, ServiceDirectory serviceDirectory, ServiceUri serviceUri, GetRestResource getRestResource, PutRestResource putRestResource, DeleteRestResource deleteRestResource, ILogger logger, CancellationToken cancellationToken)
     {
         var configurationApis = GetConfigurationApis(configurationJson);
 
@@ -26,7 +26,7 @@ internal static class Api
                           secondKeySelector: configurationArtifact => configurationArtifact.ApiName,
                           firstSelector: api => (api.ApiName, api.InformationFile, api.SpecificationFile, ConfigurationApiJson: (JsonObject?)null),
                           bothSelector: (file, configurationArtifact) => (file.ApiName, file.InformationFile, file.SpecificationFile, ConfigurationApiJson: configurationArtifact.Json))
-                .ForEachParallel(async artifact => await ProcessDeletedApi(artifact.ApiName, artifact.InformationFile, artifact.SpecificationFile, artifact.ConfigurationApiJson, serviceDirectory, serviceUri, putRestResource, deleteRestResource, logger, cancellationToken),
+                .ForEachParallel(async artifact => await ProcessDeletedApi(artifact.ApiName, artifact.InformationFile, artifact.SpecificationFile, artifact.ConfigurationApiJson, serviceDirectory, serviceUri, getRestResource, putRestResource, deleteRestResource, logger, cancellationToken),
                                  cancellationToken);
     }
 
@@ -191,7 +191,7 @@ internal static class Api
         return new(specificationFile.ApiDirectory.GetName());
     }
 
-    private static async ValueTask ProcessDeletedApi(ApiName apiName, ApiInformationFile? deletedApiInformationFile, ApiSpecificationFile? deletedSpecificationFile, JsonObject? configurationApiJson, ServiceDirectory serviceDirectory, ServiceUri serviceUri, PutRestResource putRestResource, DeleteRestResource deleteRestResource, ILogger logger, CancellationToken cancellationToken)
+    private static async ValueTask ProcessDeletedApi(ApiName apiName, ApiInformationFile? deletedApiInformationFile, ApiSpecificationFile? deletedSpecificationFile, JsonObject? configurationApiJson, ServiceDirectory serviceDirectory, ServiceUri serviceUri, GetRestResource getRestResource, PutRestResource putRestResource, DeleteRestResource deleteRestResource, ILogger logger, CancellationToken cancellationToken)
     {
         switch (deletedApiInformationFile, deletedSpecificationFile)
         {
@@ -203,7 +203,7 @@ internal static class Api
                 var existingInformationFile = TryGetExistingInformationFile(deletedSpecificationFile.ApiDirectory);
                 if (existingInformationFile is null)
                 {
-                    await Delete(apiName, serviceUri, deleteRestResource, logger, cancellationToken);
+                    await Delete(apiName, serviceUri, getRestResource, deleteRestResource, logger, cancellationToken);
                 }
                 else
                 {
@@ -216,7 +216,7 @@ internal static class Api
                 var existingSpecificationFile = TryGetExistingSpecificationFile(deletedApiInformationFile.ApiDirectory, serviceDirectory);
                 if (existingSpecificationFile is null)
                 {
-                    await Delete(apiName, serviceUri, deleteRestResource, logger, cancellationToken);
+                    await Delete(apiName, serviceUri, getRestResource, deleteRestResource, logger, cancellationToken);
                 }
                 else
                 {
@@ -226,7 +226,7 @@ internal static class Api
                 return;
             // Both information and schema file were deleted, delete API.
             case (not null, not null):
-                await Delete(apiName, serviceUri, deleteRestResource, logger, cancellationToken);
+                await Delete(apiName, serviceUri, getRestResource, deleteRestResource, logger, cancellationToken);
                 return;
         }
     }
@@ -237,12 +237,43 @@ internal static class Api
         return file.Exists() ? file : null;
     }
 
-    private static async ValueTask Delete(ApiName apiName, ServiceUri serviceUri, DeleteRestResource deleteRestResource, ILogger logger, CancellationToken cancellationToken)
+    private static async ValueTask Delete(ApiName apiName, ServiceUri serviceUri, GetRestResource getRestResource, DeleteRestResource deleteRestResource, ILogger logger, CancellationToken cancellationToken)
     {
-        logger.LogInformation("Deleting API {apiName}...", apiName);
+        logger.LogInformation("Checking if API is a current revision...");
 
-        var apiUri = GetApiUri(apiName, serviceUri);
-        await deleteRestResource(apiUri.Uri, cancellationToken);
+        if (await IsApiRevisionCurrent(apiName, serviceUri, getRestResource, cancellationToken))
+        {
+            logger.LogInformation("API {apiName} is a current revision, skipping its deletion.", apiName);
+        }
+        else
+        {
+            logger.LogInformation("Deleting API {apiName}...", apiName);
+
+            var apiUri = GetApiUri(apiName, serviceUri);
+            await deleteRestResource(apiUri.Uri, cancellationToken);
+        }
+    }
+
+    private static async ValueTask<bool> IsApiRevisionCurrent(ApiName apiName, ServiceUri serviceUri, GetRestResource getRestResource, CancellationToken cancellationToken)
+    {
+        if (apiName.ToString().Contains(";rev=", StringComparison.OrdinalIgnoreCase))
+        {
+            var apiUri = GetApiUri(apiName, serviceUri);
+
+            try
+            {
+                var json = await getRestResource(apiUri.Uri, cancellationToken);
+                return json.TryGetBoolProperty("isCurrent") ?? false;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+        else
+        {
+            return false;
+        }
     }
 
     public static ApiUri GetApiUri(ApiName apiName, ServiceUri serviceUri)
