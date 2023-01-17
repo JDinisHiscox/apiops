@@ -50,6 +50,7 @@ public static class Program
         services.AddSingleton(GetGetArmEnvironment)
                 .AddSingleton(GetHttpPipeline)
                 .AddSingleton(GetDeleteRestResource)
+                .AddSingleton(GetGetRestResource)
                 .AddSingleton(GetListRestResources)
                 .AddSingleton(GetPutRestResource)
                 .AddSingleton(GetPublisherParameters)
