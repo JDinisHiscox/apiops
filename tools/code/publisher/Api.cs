@@ -263,7 +263,9 @@ internal static class Api
             try
             {
                 var json = await getRestResource(apiUri.Uri, cancellationToken);
-                return json.TryGetBoolProperty("isCurrent") ?? false;
+
+                return json.TryGetJsonObjectProperty("properties")
+                          ?.TryGetBoolProperty("isCurrent") ?? false;
             }
             catch
             {
