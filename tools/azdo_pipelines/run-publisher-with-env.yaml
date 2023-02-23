@@ -110,7 +110,11 @@ steps:
         $ErrorActionPreference = "Stop"
         $VerbosePreference = "Continue"
         $InformationPreference = "Continue"
+        
+        Write-Information "Getting Git contents..."
+        git -C "$(Build.SourcesDirectory)/${{ parameters.API_MANAGEMENT_SERVICE_OUTPUT_FOLDER_PATH }}" diff-tree --no-commit-id --name-status --relative -r "$(Build.SourceVersion)}^" "$(Build.SourceVersion)"
 
+        Write-Information "Running publisher..."
         & "$(PUBLISHER_FILE_PATH)"                
         if ($LASTEXITCODE -ne 0) { throw "Running publisher failed."}
 
