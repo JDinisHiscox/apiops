@@ -1,4 +1,5 @@
 using common;
+using Flurl;
 using Microsoft.Extensions.Logging;
 using Microsoft.OpenApi;
 using Microsoft.OpenApi.Extensions;
@@ -6,6 +7,7 @@ using Microsoft.OpenApi.Readers;
 using MoreLinq;
 using System;
 using System.Collections.Generic;
+using System.Collections.Immutable;
 using System.IO;
 using System.Linq;
 using System.Text.Json.Nodes;
@@ -26,8 +28,8 @@ internal static class Api
                           secondKeySelector: configurationArtifact => configurationArtifact.ApiName,
                           firstSelector: api => (api.ApiName, api.InformationFile, api.SpecificationFile, ConfigurationApiJson: (JsonObject?)null),
                           bothSelector: (file, configurationArtifact) => (file.ApiName, file.InformationFile, file.SpecificationFile, ConfigurationApiJson: configurationArtifact.Json))
-                .ForEachParallel(async artifact => await ProcessDeletedApi(artifact.ApiName, artifact.InformationFile, artifact.SpecificationFile, artifact.ConfigurationApiJson, serviceDirectory, serviceUri, putRestResource, deleteRestResource, logger, cancellationToken),
-                                 cancellationToken);
+                .GroupBy(artifact => GetRootApiName(artifact.ApiName))
+                .ForEachParallel(async group => await ProcessDeletedApis(group.Key, group, serviceDirectory, serviceUri, putRestResource, deleteRestResource, logger, cancellationToken), cancellationToken);
     }
 
     private static IEnumerable<(ApiName ApiName, JsonObject Json)> GetConfigurationApis(JsonObject configurationJson)
@@ -44,7 +46,7 @@ internal static class Api
                                 });
     }
 
-    private static IEnumerable<(ApiName ApiName, ApiInformationFile? InformationFile, ApiSpecificationFile? SpecificationFile)> GetApisFromFiles(IReadOnlyCollection<FileInfo> files, ServiceDirectory serviceDirectory)
+    private static IEnumerable<(ApiName ApiName, ApiInformationFile? InformationFile, ApiSpecificationFile? SpecificationFile)> GetApisFromFiles(IEnumerable<FileInfo> files, ServiceDirectory serviceDirectory)
     {
         var informationFiles = files.Choose(file => TryGetInformationFile(file, serviceDirectory))
                                     .Select(file => (ApiName: GetApiName(file), File: file));
@@ -191,8 +193,110 @@ internal static class Api
         return new(specificationFile.ApiDirectory.GetName());
     }
 
-    private static async ValueTask ProcessDeletedApi(ApiName apiName, ApiInformationFile? deletedApiInformationFile, ApiSpecificationFile? deletedSpecificationFile, JsonObject? configurationApiJson, ServiceDirectory serviceDirectory, ServiceUri serviceUri, PutRestResource putRestResource, DeleteRestResource deleteRestResource, ILogger logger, CancellationToken cancellationToken)
+    private record RootApiName(string Value);
+
+    /// <summary>
+    /// Apis with revisions have the format 'apiName;rev=revision'. We split by ';rev=' to get the root name.
+    /// </summary>
+    private static RootApiName GetRootApiName(ApiName apiName)
     {
+        return new(new(apiName.ToString().Split(";rev=").First()));
+    }
+
+    private static async ValueTask ProcessDeletedApis(RootApiName rootApiName, IEnumerable<(ApiName ApiName, ApiInformationFile? ApiInformationFile, ApiSpecificationFile? SpecificationFile, JsonObject? ConfigurationApiJson)> artifacts, ServiceDirectory serviceDirectory, ServiceUri serviceUri, PutRestResource putRestResource, DeleteRestResource deleteRestResource, ILogger logger, CancellationToken cancellationToken)
+    {
+        // We cannot just loop through APIs and delete them. Here is a common scenario to account for:
+        // 1. User creates an API, adds two revisions, then runs extractor.
+        //    - Folders /artifacts/apis/apiName, /artifact/apis/apiName;rev=2, and /artifact/apis/apiName;rev=3 are created.
+        //    - /artifacts/apis/apiName/apiInformation.json has properties "apiRevision": 1 and isCurrent: true.
+        // 2. User sets revision 2 as current in portal, then runs extractor.
+        //    - Folders /artifacts/apis/apiName, /artifacts/apis/apiName;rev=1, and /artifact/apis/apiName;rev=3 are created.
+        //      Note that APIM returns the current revision's API name as 'apiName', not 'apiName;rev=x'.
+        //    - When the generated artifacts get merged, these changes also happen in Git:
+        //      - /artifacts/apis/apiName/apiInformation.json gets updated with "apiRevision": 2
+        //      - /artifacts/apis/apiName/apiName;rev=2 gets deleted
+        //      - /artifacts/apis/apiName/apiName;rev=1 gets created
+        // 3. User runs publisher. These changes wil be applied:
+        //    - Deletes run first, so api with name apiName;rev=2 will be marked for deletion. If we naively try to delete the API, APIM will throw an error saying we cannot delete the current API revision.
+        //      To account for this, we first check whether the API we're about to delete is the current one. If so, we delete; if not, we skip its deletion.
+        switch (GetNonEmptyApiDirectories(rootApiName, serviceDirectory))
+        {
+            // If there are no artifacts left that belong to the root API, delete the root API with all revisions
+            case []:
+                var apiName = new ApiName(rootApiName.Value);
+                await Delete(apiName, serviceUri, deleteRestResource, logger, deleteAllRevisions: true, cancellationToken);
+                break;
+            case var directories:
+                var currentRevision = GetCurrentRevision(rootApiName, serviceDirectory)
+                                      // APIM won't let us delete the current revision of a revisioned API. Make sure we know the current revision
+                                      // in order to skip its deletion.
+                                      ?? throw new InvalidOperationException($"Could not find a current API revision for API {rootApiName.Value}.");
+
+                await artifacts.ForEachParallel(async x => await ProcessDeletedApi(x.ApiName, x.ApiInformationFile, x.SpecificationFile, x.ConfigurationApiJson, currentRevision, serviceDirectory, serviceUri, putRestResource, deleteRestResource, logger, cancellationToken), cancellationToken);
+                break;
+        }
+    }
+
+    private static ImmutableList<ApiDirectory> GetNonEmptyApiDirectories(RootApiName rootApiName, ServiceDirectory serviceDirectory)
+    {
+        var apisDirectory = new ApisDirectory(serviceDirectory);
+
+        return apisDirectory.GetDirectoryInfo()
+                            .GetDirectories()
+                            // Filter out directories that don't match the root name
+                            .Where(directory => GetRootApiName(new(directory.Name)).Value.Equals(rootApiName.Value, StringComparison.OrdinalIgnoreCase))
+                            // Filter out empty directories
+                            .Where(directory => directory.EnumerateFiles("*", new EnumerationOptions { RecurseSubdirectories = true }).Any())
+                            .Select(directory => new ApiDirectory(new ApiName(directory.Name), apisDirectory))
+                            .ToImmutableList();
+    }
+
+    private static ApiRevision? GetCurrentRevision(RootApiName rootApiName, ServiceDirectory serviceDirectory)
+    {
+        var currentRevisions = GetNonEmptyApiDirectories(rootApiName, serviceDirectory)
+                                .Choose(directory =>
+                                {
+                                    var informationFile = new ApiInformationFile(directory);
+
+                                    if (informationFile.Exists())
+                                    {
+                                        var informationFileJson = informationFile.ReadAsJsonObject();
+                                        var apiName = new ApiName(directory.GetName());
+                                        var apiModel = ApiModel.Deserialize(apiName, informationFileJson);
+
+                                        // Get current API revision
+                                        return (apiModel.Properties.IsCurrent, apiModel.Properties.ApiRevision) switch
+                                        {
+                                            (true, not null) => (informationFile, new ApiRevision(apiModel.Properties.ApiRevision)) as (ApiInformationFile, ApiRevision)?,
+                                            _ => null
+                                        };
+                                    }
+                                    else
+                                    {
+                                        return null;
+                                    }
+                                })
+                                .ToImmutableList();
+
+        return currentRevisions switch
+        {
+            [] => null,
+            [var pair] => pair.Item2,
+            _ => throw new InvalidOperationException($"Found multiple revisions marked as current for API {rootApiName.Value}. Information file paths are {string.Join("; ", currentRevisions.Select(x => x.Item1.Path.ToString()))}.")
+        };
+    }
+
+    private record ApiRevision(string Value);
+
+    private static async ValueTask ProcessDeletedApi(ApiName apiName, ApiInformationFile? deletedApiInformationFile, ApiSpecificationFile? deletedSpecificationFile, JsonObject? configurationApiJson, ApiRevision currentRevision, ServiceDirectory serviceDirectory, ServiceUri serviceUri, PutRestResource putRestResource, DeleteRestResource deleteRestResource, ILogger logger, CancellationToken cancellationToken)
+    {
+        // Don't delete the current API revision
+        var apiRevision = GetApiRevision(apiName);
+        if (currentRevision.Value.Equals(apiRevision?.Value, StringComparison.OrdinalIgnoreCase))
+        {
+            return;
+        }
+
         switch (deletedApiInformationFile, deletedSpecificationFile)
         {
             // Nothing was deleted
@@ -203,7 +307,7 @@ internal static class Api
                 var existingInformationFile = TryGetExistingInformationFile(deletedSpecificationFile.ApiDirectory);
                 if (existingInformationFile is null)
                 {
-                    await Delete(apiName, serviceUri, deleteRestResource, logger, cancellationToken);
+                    await Delete(apiName, serviceUri, deleteRestResource, logger, deleteAllRevisions: false, cancellationToken);
                 }
                 else
                 {
@@ -216,7 +320,7 @@ internal static class Api
                 var existingSpecificationFile = TryGetExistingSpecificationFile(deletedApiInformationFile.ApiDirectory, serviceDirectory);
                 if (existingSpecificationFile is null)
                 {
-                    await Delete(apiName, serviceUri, deleteRestResource, logger, cancellationToken);
+                    await Delete(apiName, serviceUri, deleteRestResource, logger, deleteAllRevisions: false, cancellationToken);
                 }
                 else
                 {
@@ -226,9 +330,18 @@ internal static class Api
                 return;
             // Both information and schema file were deleted, delete API.
             case (not null, not null):
-                await Delete(apiName, serviceUri, deleteRestResource, logger, cancellationToken);
+                await Delete(apiName, serviceUri, deleteRestResource, logger, deleteAllRevisions: false, cancellationToken);
                 return;
         }
+    }
+
+    private static ApiRevision? GetApiRevision(ApiName apiName)
+    {
+        return apiName.ToString().Split(";rev=") switch
+        {
+            [var root, var revision] => new ApiRevision(revision),
+            _ => null
+        };
     }
 
     private static ApiInformationFile? TryGetExistingInformationFile(ApiDirectory apiDirectory)
@@ -237,12 +350,17 @@ internal static class Api
         return file.Exists() ? file : null;
     }
 
-    private static async ValueTask Delete(ApiName apiName, ServiceUri serviceUri, DeleteRestResource deleteRestResource, ILogger logger, CancellationToken cancellationToken)
+    private static async ValueTask Delete(ApiName apiName, ServiceUri serviceUri, DeleteRestResource deleteRestResource, ILogger logger, bool deleteAllRevisions, CancellationToken cancellationToken)
     {
         logger.LogInformation("Deleting API {apiName}...", apiName);
 
-        var apiUri = GetApiUri(apiName, serviceUri);
-        await deleteRestResource(apiUri.Uri, cancellationToken);
+        var apiUri = GetApiUri(apiName, serviceUri).Uri;
+        if (deleteAllRevisions)
+        {
+            apiUri = apiUri.SetQueryParam("deleteRevisions", true).ToUri();
+        }
+
+        await deleteRestResource(apiUri, cancellationToken);
     }
 
     public static ApiUri GetApiUri(ApiName apiName, ServiceUri serviceUri)
@@ -368,7 +486,36 @@ internal static class Api
                           secondKeySelector: configurationArtifact => configurationArtifact.ApiName,
                           firstSelector: api => (api.ApiName, api.InformationFile, api.SpecificationFile, ConfigurationApiJson: (JsonObject?)null),
                           bothSelector: (fileApi, configurationArtifact) => (fileApi.ApiName, fileApi.InformationFile, fileApi.SpecificationFile, ConfigurationApiJson: configurationArtifact.Json))
-                .ForEachParallel(async api => await PutApi(api.ApiName, api.InformationFile, api.SpecificationFile, api.ConfigurationApiJson, serviceUri, putRestResource, logger, cancellationToken),
+                .GroupBy(x => GetRootApiName(x.ApiName))
+                .ForEachParallel(async group => await ProcessArtifactsToPut(group.Key, group, serviceDirectory, serviceUri, putRestResource, logger, cancellationToken),
                                  cancellationToken);
+    }
+
+    private static async ValueTask ProcessArtifactsToPut(RootApiName rootApiName, IEnumerable<(ApiName ApiName, ApiInformationFile? ApiInformationFile, ApiSpecificationFile? SpecificationFile, JsonObject? ConfigurationApiJson)> artifacts, ServiceDirectory serviceDirectory, ServiceUri serviceUri, PutRestResource putRestResource, ILogger logger, CancellationToken cancellationToken)
+    {
+        // We need to put the current revision first before doing others.
+        // Otherwise, APIM will set whichever revision it receives first as the current revision.
+        var currentRevision = GetCurrentRevision(rootApiName, serviceDirectory);
+        int getApiOrder(ApiName apiName)
+        {
+            var apiRevision = GetApiRevision(apiName);
+            return string.Equals(currentRevision?.ToString(), apiRevision?.ToString(), StringComparison.OrdinalIgnoreCase)
+                    ? 0
+                    : 1;
+        };
+        var orderedArtifacts = artifacts.OrderBy(artifact => getApiOrder(artifact.ApiName))
+                                        .ToImmutableArray();
+
+        switch (orderedArtifacts)
+        {
+            case []: break;
+            case [var singleArtifact]:
+                await PutApi(singleArtifact.ApiName, singleArtifact.ApiInformationFile, singleArtifact.SpecificationFile, singleArtifact.ConfigurationApiJson, serviceUri, putRestResource, logger, cancellationToken);
+                break;
+            case [var currentRevisionArtifact, .. var otherArtifacts]:
+                await PutApi(currentRevisionArtifact.ApiName, currentRevisionArtifact.ApiInformationFile, currentRevisionArtifact.SpecificationFile, currentRevisionArtifact.ConfigurationApiJson, serviceUri, putRestResource, logger, cancellationToken);
+                await otherArtifacts.ForEachParallel(async artifact => await PutApi(artifact.ApiName, artifact.ApiInformationFile, artifact.SpecificationFile, artifact.ConfigurationApiJson, serviceUri, putRestResource, logger, cancellationToken), cancellationToken);
+                break;
+        }
     }
 }
